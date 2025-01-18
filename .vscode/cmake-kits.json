@@ -1,0 +1,8 @@
+[
+  {
+    "name": "ARM GCC (Pico)",
+    "environmentVariables": {
+      "PATH": "${env.PICO_SDK_COMPILER_PATH};${env.PATH}"
+    }
+  }
+]

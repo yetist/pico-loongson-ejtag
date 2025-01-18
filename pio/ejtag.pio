@@ -1,0 +1,30 @@
+
+.program ejtag_tdi
+.side_set 1
+.wrap_target
+    pull block              side 0      // Fetch output bit length, block if no data in FIFO
+    mov x, osr              side 0      // Transfer into X register
+    pull                    side 0      // Pull the initial TDI word
+tdi_sm_loop:
+    out pins, 1             side 0      // Shift TDI out
+    nop                     side 1      // Assert TCK
+    pull ifempty            side 1      // Pull subsequent TDI words if current OSR is empty
+    jmp x--, tdi_sm_loop    side 0      // If (X--) is not zero, shift next bit
+                                        // Therefore X initial value should be (bit length minus 1)
+.wrap                                   // If (X--) is zero, wrap around and start a new transaction
+
+.program ejtag_tdo
+.origin 8
+.side_set 1
+.wrap_target
+    pull block              side 0      // Fetch initial delay cycle count, block if no data in FIFO
+    mov x, osr              side 1      // Count initial delay cycles in X register
+    pull                    side 0      // Fetch read bit length (aligned to 32 bits)
+    mov y, osr              side 0      // Count read bit length in Y register (reads in Y+1 bits)
+tdo_sm_wait:
+    jmp x--, tdo_sm_wait    side 0      // Wait for specified cycles (actually waits X+1 cycles)
+tdo_sm_loop:
+    in pins, 1              side 1  [1] // Read TDO and delay 1 cycle
+    push iffull             side 0      // Push TDO words to memory if current ISR is full
+    jmp y--,tdo_sm_loop     side 0      // If (Y--) is zero, wrap around and start a new transaction
+.wrap
