@@ -1,9 +1,13 @@
 
+#include <pico/stdlib.h>
+#include <hardware/uart.h>
 #include <hardware/gpio.h>
 #include <hardware/pio.h>
+#include <hardware/dma.h>
 #include <tusb.h>
 #include <string.h>
 
+#include "shell_port.h"
 #include "lsejtag/lsejtag.h"
 #include "config.h"
 #include "ejtag.h"
@@ -13,57 +17,104 @@
 
 lsejtag_ctx lsejtag_lib_ctx;
 ejtag_impl_ctx ejtag_ctx;
+Shell shell;
+char shellBuffer[512];
 
 void init_hardware();
 void init_software();
+void init_reset_tap_via_tms();
+void init_print_clock();
+
+void led_task();
 
 int main() {
     init_hardware();
     init_software();
+    init_reset_tap_via_tms();
+    init_print_clock();
+
+    // testdma();
 
     while (1) {
-        // Fetch from FIFO prevent TDO SM from stalling
-        if (!pio_sm_is_rx_fifo_empty(pio0, 2)) {
-            int tdo_val = *ejtag_ctx.tdo_read_addr;
-            if (tdo_val != 0x5a5a5a5a) {
-                panic("TDO readout invalid (expect 0x5a5a5a5a, got 0x%08x)", tdo_val);
-            }
+        tud_task();
+        // shellTask(&shell);
+        led_task();
+
+        switch (lsejtag_dispatch(&lsejtag_lib_ctx)) {
+        case dpr_execute:
+            lsejtag_execute(&lsejtag_lib_ctx);
+            break;
+        case dpr_incomplete:
+            break;
+        case dpr_flush_tdo:
+            lsejtag_flush_tdo(&lsejtag_lib_ctx);
+            break;
+        case dpr_run_jtag:
+            lsejtag_run_jtag(&lsejtag_lib_ctx);
+            break;
+        case dpr_too_long:
+            panic("LSEJTAG command too long");
+        case dpr_unknown_cmd:
+            break;
+        case dpr_corrupt_state:
+            printf("!!!!!! dpr_corrput_state !!!!!!\n");
+            printf("cmd buf dump:\n");
+            // dump_binary_to_console(ctx->buffered_cmd, sizeof(ctx->buffered_cmd));
+            printf("buffered_length: %d\r", (int)lsejtag_lib_ctx.buffered_length);
+            printf("wait_payload_size: %d\n", (int)lsejtag_lib_ctx.cmd_buf_wait_payload_size);
+            printf("state: %d\n",lsejtag_lib_ctx.cmd_buf_state);
+            panic("LSEJTAG corrupt state");
+        case dpr_clean:
+          break;
         }
+    }
+}
 
-        // Stop EJTAG
-        pio_set_sm_mask_enabled(pio0, 0x7, false);
+//==============================================================================
+// Util
+//==============================================================================
 
-        // TDI: 57 bits
-        // [8+5 Bits of 0] 1-0-0-0 (IDCODE) [Zeros]
-        *ejtag_ctx.tdi_write_addr = 55 - 1; // Bit count
-        *ejtag_ctx.tdi_write_addr = 0x00002000;
-        *ejtag_ctx.tdi_write_addr = 0x00000000;
+static inline uint32_t ws2812_rgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+    return
+            ((uint32_t) (r) << 8) |
+            ((uint32_t) (g) << 16) |
+            (uint32_t) (b);
+}
 
-        // TMS: 57 bits
-        // 1-1-1-1-1-1-1-0 (Go to Run-Test/Idle)
-        // 0-1-1-0-0 [3x 0] 1-1-1 (Update-IR) 0-0 (Shift-DR) [31x 0] 1-1-0 (Idle)
-        *ejtag_ctx.tms_write_addr = 55 - 1; // Bit count
-        *ejtag_ctx.tms_write_addr = 0x0007067F;
-        *ejtag_ctx.tms_write_addr = 0x00300000;
+//==============================================================================
+// Other tasks
+//==============================================================================
 
-        // TDI:
-        // Skip (8+5+3+3+2) * 4 cycles (Garbage data)
-        *ejtag_ctx.tdo_write_addr = 4 * 21 - 1; // Initial delay cycles
-        *ejtag_ctx.tdo_write_addr = 32 - 1; // Read length
-
-        // Enable EJTAG
-        pio_enable_sm_mask_in_sync(pio0, 0x7);
-
-        sleep_ms(1000);
+void led_task() {
+    // LED illumination logic
+    if (ejtag_ctx.led_turn_on) {
+        ejtag_ctx.led_turn_on = 0;
+        ejtag_ctx.led_timer_us = time_us_32();
         *ejtag_ctx.ws2812_write_addr = 0x10200000;
-        sleep_ms(1000);
+        return;
+    }
+
+    if (ejtag_ctx.led_timer_us == 0) {
+        return;
+    }
+
+    // 300ms
+    if (time_us_32() - ejtag_ctx.led_timer_us >= 300000) {
         *ejtag_ctx.ws2812_write_addr = 0x00200000;
+        ejtag_ctx.led_timer_us = 0;
     }
 }
 
 //==============================================================================
 // Initialization
 //==============================================================================
+
+void init_uart() {
+    stdio_uart_init_full(uart0, 115200, 0, 1);
+
+    printf("Pico Loongson EJTAG - By RigoLigo, FW Version " FIRMWARE_VERSION_STR "\n");
+    printf("The Loongson EJTAG Probe reimplementation on RP2040.\n");
+}
 
 void init_gpio() {
     gpio_init(EJTAG_PIN_TRST);
@@ -84,20 +135,20 @@ void init_gpio() {
 }
 
 void init_pio() {
-    PIO pio;
-    uint sm;
-    uint offset;
     pio_sm_config smcfg = pio_get_default_sm_config();
     static const char panic_text[] = "%s PIO SM allocation failed. This should not happen.";
 
     // TDI/TMS SM program
     if (pio_add_program_at_offset(pio0, &ejtag_tdi_program, 0) < 0) {
-        panic(panic_text, "TDI/TMS");
+        panic(panic_text, "TDI");
     }
-    if (pio_add_program_at_offset(pio0, &ejtag_tdo_program, 8) < 0) {
+    if (pio_add_program_at_offset(pio0, &ejtag_tdi_program, 8) < 0) {
+        panic(panic_text, "TMS");
+    }
+    if (pio_add_program_at_offset(pio0, &ejtag_tdo_program, 16) < 0) {
         panic(panic_text, "TDO");
     }
-    if (pio_add_program_at_offset(pio0, &ws2812_program, 16) < 0) {
+    if (pio_add_program_at_offset(pio0, &ws2812_program, 28) < 0) {
         panic(panic_text, "WS2812");
     }
 
@@ -111,45 +162,130 @@ void init_pio() {
     // TDI SM (PIO0, SM0) config
     pio_sm_set_consecutive_pindirs(pio0, 0, EJTAG_PIN_TDI, 1, true);
     pio_sm_set_consecutive_pindirs(pio0, 0, EJTAG_PIN_TCK, 1, true);
-    sm_config_set_fifo_join(&smcfg, PIO_FIFO_JOIN_NONE);
+    sm_config_set_fifo_join(&smcfg, PIO_FIFO_JOIN_TX);
     sm_config_set_out_pins(&smcfg, EJTAG_PIN_TDI, 1);
     sm_config_set_out_shift(&smcfg, true, false, 0);
     sm_config_set_sideset_pins(&smcfg, EJTAG_PIN_TCK);
     sm_config_set_sideset(&smcfg, 1, false, false);
     sm_config_set_wrap(&smcfg, ejtag_tdi_wrap_target, ejtag_tdi_wrap);
-    sm_config_set_clkdiv(&smcfg, 32.f);
+    sm_config_set_clkdiv(&smcfg, 6.f);
     pio_sm_init(pio0, 0, 0, &smcfg);
     ejtag_ctx.tdi_write_addr = &pio0->txf[0];
+
+    // TDI SM IRQ (IRQ bit 0, this is for TDI&TMS completion handler since they are in sync)
+    irq_set_exclusive_handler(PIO0_IRQ_0, isr_pio0_irq0);
+    pio_set_irq0_source_enabled(pio0, pis_interrupt0, true);
+    irq_set_enabled(PIO0_IRQ_0, true);
 
     // TMS SM (PIO0, SM1) config
     pio_sm_set_consecutive_pindirs(pio0, 1, EJTAG_PIN_TMS, 1, true);
     sm_config_set_out_pins(&smcfg, EJTAG_PIN_TMS, 1);
-    pio_sm_init(pio0, 1, 0, &smcfg);
+    sm_config_set_wrap(&smcfg, ejtag_tms_wrap_target + 8, ejtag_tms_wrap + 8);
+    pio_sm_init(pio0, 1, 8, &smcfg);
     ejtag_ctx.tms_write_addr = &pio0->txf[1];
 
     // TDO SM (PIO0, SM2) config
     pio_sm_set_consecutive_pindirs(pio0, 2, EJTAG_PIN_TDO, 1, false);
     pio_sm_set_consecutive_pindirs(pio0, 2, EJTAG_PIN_TDO_SAMPLE_TIME, 1, true);
+    sm_config_set_fifo_join(&smcfg, PIO_FIFO_JOIN_NONE);
     sm_config_set_sideset_pins(&smcfg, EJTAG_PIN_TDO_SAMPLE_TIME);
     sm_config_set_in_pins(&smcfg, EJTAG_PIN_TDO);
-    sm_config_set_wrap(&smcfg, ejtag_tdo_wrap_target + 8, ejtag_tdo_wrap + 8);
-    pio_sm_init(pio0, 2, 8, &smcfg);
+    sm_config_set_wrap(&smcfg, ejtag_tdo_wrap_target + 16, ejtag_tdo_wrap + 16);
+    pio_sm_init(pio0, 2, 16, &smcfg);
     ejtag_ctx.tdo_write_addr = &pio0->txf[2];
     ejtag_ctx.tdo_read_addr = &pio0->rxf[2];
 
-    pio_sm_clear_fifos(pio0, 2);
-
     // WS2812 SM (PIO0, SM3) config
-    ws2812_program_init(pio0, 3, 16, WS2812_PIN, 800000, false);
+    ws2812_program_init(pio0, 3, 28, WS2812_PIN, 800000, false);
     ejtag_ctx.ws2812_write_addr = &pio0->txf[3];
 }
 
+void init_dma() {
+    dma_channel_config cfg;
+
+    ejtag_ctx.tdi_chan = dma_claim_unused_channel(true);
+    cfg = dma_channel_get_default_config(ejtag_ctx.tdi_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&cfg, true);
+    channel_config_set_write_increment(&cfg, false);
+    channel_config_set_dreq(&cfg, DREQ_PIO0_TX0);
+    // channel_config_set_irq_quiet(&cfg, true);
+    dma_channel_configure(ejtag_ctx.tdi_chan, &cfg, ejtag_ctx.tdi_write_addr, NULL, 0, false);
+
+    ejtag_ctx.tms_chan = dma_claim_unused_channel(true);
+    channel_config_set_dreq(&cfg, DREQ_PIO0_TX1);
+    dma_channel_configure(ejtag_ctx.tms_chan, &cfg, ejtag_ctx.tms_write_addr, NULL, 0, false);
+
+    ejtag_ctx.tdo_chan = dma_claim_unused_channel(true);
+    channel_config_set_read_increment(&cfg, false);
+    channel_config_set_write_increment(&cfg, true);
+    channel_config_set_dreq(&cfg, DREQ_PIO0_RX2);
+    dma_channel_configure(ejtag_ctx.tdo_chan, &cfg, NULL, ejtag_ctx.tdo_read_addr, 0, false);
+
+    ejtag_ctx.dma_start_mask_no_tdo = (1 << ejtag_ctx.tdi_chan) | (1 << ejtag_ctx.tms_chan);
+    ejtag_ctx.dma_start_mask = (1 << ejtag_ctx.tdo_chan) | ejtag_ctx.dma_start_mask_no_tdo;
+
+    // Interrupts
+    dma_channel_set_irq0_enabled(ejtag_ctx.tdi_chan, true);
+    dma_channel_set_irq0_enabled(ejtag_ctx.tms_chan, true);
+    dma_channel_set_irq1_enabled(ejtag_ctx.tdo_chan, true);
+
+    irq_set_exclusive_handler(DMA_IRQ_0, isr_dma_irq0);
+    irq_set_exclusive_handler(DMA_IRQ_1, isr_dma_irq1);
+    irq_set_enabled(DMA_IRQ_0, true);
+    irq_set_enabled(DMA_IRQ_1, true);
+}
+
 void init_hardware() {
+    init_uart();
     init_gpio();
     init_pio();
+    init_dma();
 }
 
+void init_task_context() {
+    // LED task
+    ejtag_ctx.led_timer_us = 0;
+    ejtag_ctx.led_turn_on = 0;
+    // Make red LED illuminate
+    *ejtag_ctx.ws2812_write_addr = 0x00200000;
+}
 
 void init_software() {
-    tusb_init();
+    lsejtag_init_ctx(&lsejtag_lib_ctx);
+    tud_init(BOARD_TUD_RHPORT);
+    init_task_context();
+
+    // shell.write = shell_port_write_usb;
+    // // shell.read = shell_port_read_usb;
+    // shellInit(&shell, shellBuffer, sizeof(shellBuffer));
 }
+
+void init_reset_tap_via_tms() {
+    *ejtag_ctx.tms_write_addr = 31;
+    *ejtag_ctx.tms_write_addr = 0x0FFFFFFF;
+    pio_set_sm_mask_enabled(pio0, 0x2, true);
+    sleep_ms(5); // This is more than enough!
+    pio_set_sm_mask_enabled(pio0, 0x7, false);
+}
+
+void init_print_clock() {
+    uint f_pll_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_SYS_CLKSRC_PRIMARY);
+    uint f_pll_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_PLL_USB_CLKSRC_PRIMARY);
+    uint f_rosc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_ROSC_CLKSRC);
+    uint f_clk_sys = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS);
+    uint f_clk_peri = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_PERI);
+    uint f_clk_usb = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_USB);
+    uint f_clk_adc = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_ADC);
+
+    puts("Clocks debug:");
+    printf("pll_sys  = %dkHz\n", f_pll_sys);
+    printf("pll_usb  = %dkHz\n", f_pll_usb);
+    printf("rosc     = %dkHz\n", f_rosc);
+    printf("clk_sys  = %dkHz\n", f_clk_sys);
+    printf("clk_peri = %dkHz\n", f_clk_peri);
+    printf("clk_usb  = %dkHz\n", f_clk_usb);
+    printf("clk_adc  = %dkHz\n", f_clk_adc);
+}
+
+

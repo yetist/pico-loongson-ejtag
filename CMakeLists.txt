@@ -4,11 +4,19 @@ set(PICO_TOOLCHAIN_PATH $ENV{PICO_SDK_COMPILER_PATH})
 include($ENV{PICO_SDK_BASE}/external/pico_sdk_import.cmake)
 
 project(pico-loongson-ejtag LANGUAGES C CXX ASM)
+# set(PICO_DEOPTIMIZED_DEBUG 1)  # Uncomment under Debug mode to disable -Og flag
 pico_sdk_init()
 
 file(GLOB_RECURSE SOURCES ${CMAKE_CURRENT_LIST_DIR}/src/*.c)
 
-include_directories(${CMAKE_CURRENT_LIST_DIR}/inc)
+add_compile_options(
+    -Wall -Wextra -Werror=uninitialized -Werror=return-type -Werror=unused-result
+)
+
+include_directories(
+    ${CMAKE_CURRENT_LIST_DIR}/inc
+    ${CMAKE_CURRENT_LIST_DIR}/inc/letter-shell
+)
 add_executable(${PROJECT_NAME}
     ${SOURCES}
 )

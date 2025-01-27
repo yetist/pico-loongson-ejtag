@@ -22,7 +22,7 @@ typedef struct {
     uint16_t op : 6;
 } lsejtag_cmd_header_probe_mem_rw;
 
-typedef struct {
+typedef struct __attribute((packed)) {
     lsejtag_cmd_header_probe_mem_rw header;
     uint32_t addr;
     uint32_t data_to_write; // OPTIONAL
@@ -45,8 +45,8 @@ typedef struct {
 // 0x04 - IR R/W
 typedef struct {
     uint16_t reserved : 8;
-    uint16_t restore_register : 1;
-    uint16_t is_write : 1;
+    uint16_t immediate_send_back : 1;
+    uint16_t read_back : 1;
     uint16_t op : 6;
 } lsejtag_cmd_header_ir_rw;
 
@@ -60,8 +60,8 @@ typedef struct {
 // 0x05 - DR R/W
 typedef struct {
     uint16_t reserved : 8;
-    uint16_t restore_register : 1;
-    uint16_t is_write : 1;
+    uint16_t immediate_send_back : 1;
+    uint16_t read_back : 1;
     uint16_t op : 6;
 } lsejtag_cmd_header_dr_rw;
 

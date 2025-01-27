@@ -1,18 +1,19 @@
 
+#include <stdio.h>
+#include <string.h>
 #include "lsejtag/lsejtag.h"
 #include "lsejtag/lsejtag_impl.h"
-#include "lsejtag/cmdop.h"
+#include "lsejtag/cmdimpl.h"
 
 // Function prototypes
 static inline lsejtag_cmd_exec_result lsejtag_execute_continuation(lsejtag_ctx *ctx);
 
 // Code
-#define BIT2DWORD(x) ((x) + 31 / 32)
 #define CHECK_CMD_LENGTH(ctx) \
     do { \
         if ((ctx)->buffered_length + (ctx)->cmd_buf_wait_payload_size > \
             sizeof((ctx)->buffered_cmd)) { \
-            return fcr_too_long; \
+            return dpr_too_long; \
         } \
     } while (0); \
 
@@ -21,66 +22,47 @@ static inline bool is_continuation_capable_op(lsejtag_cmd_op op) {
            op == op_fast_target_mem_read_fastdata || op == op_fast_target_mem_write_fastdata;
 }
 
-static uint32_t usb_tx_len_required(lsejtag_ctx *ctx) {
-    lsejtag_cmd *cmd = (lsejtag_cmd *)ctx->buffered_cmd;
-    
-    switch (cmd->common.header.op) {
-    case op_probe_mem_rw:
-        return cmd->probe_mem_rw.header.is_write ? 0 : 4;
-    case op_io_manip:
-        return 0;
-    case op_ir_rw:
-        return cmd->ir_rw.header.is_write ? 0 : (BIT2DWORD(cmd->ir_rw.irseq_len_bits) * 4);
-    case op_dr_rw:
-        return cmd->dr_rw.header.is_write ? 0 : (BIT2DWORD(cmd->ir_rw.irseq_len_bits) * 4);
-    case op_loopback_test:
-    case op_get_firmware_date:
-        return 4;
-    case op_fast_target_mem_write_fastdata:
-    case op_fast_target_mem_write:
-        return 0;
-    case op_fast_target_mem_read_fastdata:
-    case op_fast_target_mem_read: {
-        lsejtag_cmd_fast_target_mem_read_at_core *read_cmd = &cmd->fast_mem_read_at_core;
-        uint32_t bytes_per_machine_word = 
-            BIT2DWORD((read_cmd->header.cpu_is_64bit ? 64 : 32) +
-                      read_cmd->header.chained_core_count) * 4;
-        uint32_t bytes_to_send = bytes_per_machine_word * read_cmd->data_len_dword_count;
-        return bytes_to_send;
-    }
-    default:
-        return 0;
-    }
-}
-
 void lsejtag_init_ctx(lsejtag_ctx *ctx) {
-    ctx->buffered_length = 0;
-    ctx->cmd_buf_state = cbs_clean;
+    memset(ctx, 0, sizeof(lsejtag_ctx));
+    ctx->tdo_dma_ptr = ctx->tdo_in_data;
+    ctx->tdo_flush_ptr = ctx->tdo_in_data;
 }
 
-lsejtag_fetch_cmd_result lsejtag_fetch_cmd(lsejtag_ctx *ctx) {
+lsejtag_dispatch_result lsejtag_dispatch(lsejtag_ctx *ctx) {
     uint32_t len_rx = lsejtag_impl_usbrx_len();
     uint32_t len_avail = len_rx + ctx->buffered_length;
     const lsejtag_cmd_header *header = (const lsejtag_cmd_header *)ctx->buffered_cmd;
     const lsejtag_cmd *cmd = (const lsejtag_cmd *)ctx->buffered_cmd;
 
-    if (ctx->jtagbuf_a.tdo_dwords != 0 || ctx->jtagbuf_b.tdo_dwords != 0) {
-        return fcr_flush_tdo;
+    // If new data appeared in TDO buffer, check if it needs an immediate flush. If not, ignore the
+    // new data for now. If it needs, force the user flush TDO buffer until TDO buffer is clear.
+    if (ctx->tdo_should_flush) {
+        return dpr_flush_tdo;
+    } else if (ctx->tdo_immediate_flush) {
+        if (ctx->tdo_have_new_data) {
+            ctx->tdo_have_new_data = false;
+            ctx->tdo_should_flush = true;
+            return dpr_flush_tdo;
+        }
+    }
+
+    if (ctx->jtagbuf_a.prepared || ctx->jtagbuf_b.prepared) {
+        return dpr_run_jtag;
     }
 
     if (len_rx == 0 && ctx->buffered_length == 0) {
-        return fcr_clean;
+        return dpr_clean;
     }
 
     if (ctx->cmd_buf_state == cbs_clean) {
         // Starting from a clean buffer
         if (len_rx == 0) {
-            return fcr_clean;
+            return dpr_clean;
         } else if (len_rx == 1) {
             lsejtag_impl_usbrx_consume(ctx->buffered_cmd, 1);
             ctx->buffered_length = 1;
             ctx->cmd_buf_state = cbs_wait_header;
-            return fcr_incomplete;
+            return dpr_incomplete;
         }
 
         // Get a command header
@@ -100,7 +82,7 @@ lsejtag_fetch_cmd_result lsejtag_fetch_cmd(lsejtag_ctx *ctx) {
             ctx->cmd_buf_state = cbs_wait_cfg;
             goto wait_cfg;
         } else {
-            return fcr_incomplete;
+            return dpr_incomplete;
         }
     } else if (ctx->cmd_buf_state == cbs_wait_cfg) {
         // Reading configuration section
@@ -112,7 +94,7 @@ wait_cfg:
             goto wait_payload;
         case op_io_manip:
             ctx->cmd_buf_state = cbs_execute;
-            return fcr_execute;
+            return dpr_execute;
         case op_ir_rw:
         case op_dr_rw:
             if (len_avail > 4) { // header(u16) + ir_seq_bitlen(u16)
@@ -133,7 +115,7 @@ wait_cfg:
                 lsejtag_impl_usbrx_consume(ctx->buffered_cmd + ctx->buffered_length,
                                            6 - ctx->buffered_length);
                 ctx->cmd_buf_state = cbs_execute;
-                return fcr_execute;
+                return dpr_execute;
             }
             break;
         case op_fast_target_mem_write_fastdata:
@@ -166,21 +148,23 @@ wait_cfg:
                 len_rx -= consume_len;
                 ctx->buffered_length += consume_len;
                 ctx->cmd_buf_state = cbs_execute;
-                return fcr_execute;
+                return dpr_execute;
             }
             break;
         case op_get_firmware_date:
             ctx->cmd_buf_state = cbs_execute;
-            return fcr_execute;
+            return dpr_execute;
         default:
-            return fcr_unknown_cmd;
+            ctx->buffered_length = 0;
+            ctx->cmd_buf_state = cbs_clean;
+            return dpr_unknown_cmd;
         }
 
         // This is where we landed after breaks
         // Since available length is not enough for config section anyways, we consume them all
         lsejtag_impl_usbrx_consume(ctx->buffered_cmd + ctx->buffered_length, len_rx);
         ctx->buffered_length += len_rx;
-        return fcr_incomplete;
+        return dpr_incomplete;
     } else if (ctx->cmd_buf_state == cbs_wait_payload) {
 wait_payload:
         // Payload isn't long enough anyways, consume them all
@@ -188,7 +172,7 @@ wait_payload:
             lsejtag_impl_usbrx_consume(ctx->buffered_cmd + ctx->buffered_length, len_rx);
             ctx->buffered_length += len_rx;
             ctx->cmd_buf_wait_payload_size -= len_rx;
-            return fcr_incomplete;
+            return dpr_incomplete;
         } else {
             // We can assemble a complete command now
             const uint32_t consume_len = ctx->cmd_buf_wait_payload_size;
@@ -196,15 +180,16 @@ wait_payload:
             ctx->buffered_length += consume_len;
             ctx->cmd_buf_wait_payload_size = 0;
             ctx->cmd_buf_state = cbs_execute;
-            return fcr_execute;
+            return dpr_execute;
         }
+    } else if (ctx->cmd_buf_state == cbs_execute) {
+        return dpr_execute;
     } else {
-        return fcr_corrupt_state;
+        return dpr_corrupt_state;
     }
 }
 
 lsejtag_cmd_exec_result lsejtag_execute(lsejtag_ctx *ctx) {
-    uint32_t usb_tx_len = 0;
     lsejtag_cmd *cmd = (lsejtag_cmd *)ctx->buffered_cmd;
 
     if (ctx->cmd_buf_state != cbs_execute) {
@@ -215,23 +200,15 @@ lsejtag_cmd_exec_result lsejtag_execute(lsejtag_ctx *ctx) {
         return lsejtag_execute_continuation(ctx);
     }
 
-    usb_tx_len = usb_tx_len_required(ctx);
-    if (!is_continuation_capable_op(cmd->common.header.op) &&
-        usb_tx_len > lsejtag_impl_usbtx_free_len()) {
-        // Continuation capable ops are exempted. They do actually handle large amount of data and
-        // doesn't have to send all of them in one go.
-        return cer_await_usb_tx;
-    }
-
     switch (cmd->common.header.op) {
         case op_probe_mem_rw:
             return cmdimpl_probe_mem_rw(ctx);
         case op_io_manip:
             return cmdimpl_io_manip(ctx);
         case op_ir_rw:
-            break;
+            return cmdimpl_irdr_write(ctx, true);
         case op_dr_rw:
-            break;
+            return cmdimpl_irdr_write(ctx, false);
         case op_loopback_test:
             break;
         case op_fast_target_mem_write_fastdata:
@@ -245,6 +222,8 @@ lsejtag_cmd_exec_result lsejtag_execute(lsejtag_ctx *ctx) {
         case op_get_firmware_date:
             return cmdimpl_get_firmware_date(ctx);
     }
+
+    return cer_success;
 }
 
 static inline lsejtag_cmd_exec_result lsejtag_execute_continuation(lsejtag_ctx *ctx) {
@@ -252,5 +231,52 @@ static inline lsejtag_cmd_exec_result lsejtag_execute_continuation(lsejtag_ctx *
         return cer_bad_continue;
     }
 
+    // TODO:
+    return cer_bad_continue;
+}
 
+uint32_t lsejtag_flush_tdo(lsejtag_ctx *ctx) {
+    const uint32_t max_send_bytes = lsejtag_impl_usbtx_free_len();
+
+    if (max_send_bytes >= ctx->tdo_in_dwords * 4) {
+        // We can completely flush TDO data
+        lsejtag_impl_usbtx((uint8_t *)ctx->tdo_flush_ptr, ctx->tdo_in_dwords * 4);
+        ctx->tdo_in_dwords = 0;
+        ctx->tdo_flush_ptr = ctx->tdo_in_data;
+        ctx->tdo_dma_ptr = ctx->tdo_in_data;
+        ctx->tdo_immediate_flush = false;
+        ctx->tdo_should_flush = false;
+        return ctx->tdo_in_dwords * 4;
+    } else {
+        // We can only flush a portion of TDO data
+        const uint32_t send_dwords = max_send_bytes / 4;
+        lsejtag_impl_usbtx((uint8_t *)ctx->tdo_flush_ptr, send_dwords * 4);
+        ctx->tdo_flush_ptr += send_dwords;
+        ctx->tdo_in_dwords -= send_dwords;
+        return send_dwords * 4;
+    }
+}
+
+void lsejtag_run_jtag(lsejtag_ctx *ctx) {
+    struct lsejtag_jtagbuf_blk *bufblk;
+
+    if (ctx->jtagbuf_a.prepared) {
+        bufblk = &ctx->jtagbuf_a;
+    } else if (ctx->jtagbuf_b.prepared) {
+        bufblk = &ctx->jtagbuf_b;
+    } else {
+        // ??
+        return;
+    }
+
+    ctx->active_bufblk = bufblk;
+    ctx->tdo_immediate_flush = bufblk->immediate_flush_tdo;
+    bufblk->tdi_busy = true;
+    bufblk->tms_busy = true;
+    lsejtag_impl_run_jtag(bufblk->tdi_data, bufblk->tms_data, ctx->tdo_dma_ptr, bufblk->tdi_bits,
+                          bufblk->tdo_bits, bufblk->tdo_skip_bits);
+    bufblk->prepared = false;
+    if (bufblk->tdo_bits) {
+        ctx->tdo_busy = true;
+    }
 }

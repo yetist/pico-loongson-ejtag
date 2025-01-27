@@ -2,7 +2,7 @@
 #pragma once
 
 #include <stdint.h>
-
+#include <stdbool.h>
 
 /*==============================================================================
  *                       P O R T I N G    G U I D E
@@ -29,21 +29,22 @@
  *      done later after `lsejtag_execute()` has returned. Each call to
  *      `lsejtag_execute()` will result in only one `lsejtag_impl_usbtx()` call.
  *      Sending of asynchronously collected TDO data is handled inside
- *      `lsejtag_flush_tdo()` when `lsejtag_fetch_cmd()` asks you to do so.
+ *      `lsejtag_flush_tdo()` when `lsejtag_dispatch()` asks you to do so.
  * 
  *  void lsejtag_impl_io_manip(lsejtag_impl_io io, uint8_t level);
+ *      TODO:
+ *
+ *  void lsejtag_impl_run_jtag_setup(uint32_t tdi_bits, uint32_t tdo_bits,
+ *                                   uint32_t tdo_skip_bits)
  *      TODO:
  *
  *============================================================================*/
 
 typedef enum {
-    io_led,                 // Green LED. Default to low.
-    io_fpga_reset,          // Non-used.
-    io_oe,                  // JTAG output enable. When OE is low output is enabled. Default to low.
-    io_trst,                // TRST pin. Default to high.
-    io_brst,                // BRST pin. Default to high.
-    io_dint,                // DINT pin. Default to high.
-    io_tap_reset,           // Non-used.
+    impl_io_led,
+    impl_io_trst,
+    impl_io_brst,
+    impl_io_dint,
 } lsejtag_impl_io;
 
 uint32_t lsejtag_impl_usbrx_len();
@@ -55,3 +56,8 @@ void lsejtag_impl_usbrx_consume(uint8_t *dest, uint32_t len);
 void lsejtag_impl_usbtx(const uint8_t *data, uint32_t len);
 
 void lsejtag_impl_io_manip(lsejtag_impl_io io, uint8_t level);
+
+void lsejtag_impl_run_jtag_setup(uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits);
+
+void lsejtag_impl_run_jtag(const uint32_t *tdi_buf, const uint32_t *tms_buf, uint32_t *tdo_buf,
+                           uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits);

@@ -22,6 +22,18 @@ typedef enum {
 } lsejtag_cmd_op;
 
 // INTERNAL USE.
+typedef enum {
+    io_led,                 // Green LED. Default to low.
+    io_fpga_reset,          // Non-used.
+    io_oe,                  // JTAG output enable. When OE is low output is enabled. Default to low.
+    io_trst,                // TRST pin. Default to high.
+    io_brst,                // BRST pin. Default to high.
+    io_dint,                // DINT pin. Default to high.
+    io_tap_reset,           // Non-used.
+    io_maximum,
+} lsejtag_io;
+
+// INTERNAL USE.
 typedef struct {
     union {
         uint16_t u16;
@@ -63,37 +75,46 @@ typedef enum {
 } lsejtag_cmd_buf_state;
 
 typedef enum {
-    fcr_execute,        // A command was successfully fetched, call `lsejtag_exec_cmd` immediately.
-    fcr_clean,          // Command buffer and user provided USB RX FIFO are both empty. This result
+    dpr_execute,        // A command was successfully fetched, call `lsejtag_exec_cmd` immediately.
+    dpr_clean,          // Command buffer and user provided USB RX FIFO are both empty. This result
                         // indicates a clean end state.
-    fcr_incomplete,     // An incomplete command was fetched and buffered. User USB RX FIFO is
+    dpr_incomplete,     // An incomplete command was fetched and buffered. User USB RX FIFO is
                         // exhausted.
-    fcr_flush_tdo,      // User should call `lsejtag_flush_tdo` immediately to flush TDO. This code
-                        // does not imply any status of command buffer; `lsejtag_fetch_cmd` must be
+    dpr_flush_tdo,      // User should call `lsejtag_flush_tdo` immediately to flush TDO. This code
+                        // does not imply any status of command buffer; `lsejtag_dispatch` must be
                         // called again immediately after flushing TDO buffer to find out current
                         // status of command buffer.
-    fcr_too_long,       // An excessively long command was found and was too large to fit in scratch
+    dpr_run_jtag,       // A prepared JTAG buffer is available and user must call `lsejtag_run_jtag`
+                        // to start an JTAG transaction. This is usually returned after a successful
+                        // JTAG command was executed.
+    dpr_too_long,       // An excessively long command was found and was too large to fit in scratch
                         // buffer. This is a fatal error. Notice that this error is not emitted for
                         // `op_fast_target_mem_write*` ops, since this op really do deal with large
                         // amount of data. Special continuation logic is implemented for this op
                         // to make it work across multiple `lsejtag_execute` calls.
-    fcr_unknown_cmd,    // An unknown command was found. This may be emitted after command header
+    dpr_unknown_cmd,    // An unknown command was found. This may be emitted after command header
                         // was read. Ignore this error.
-    fcr_corrupt_state,  // An invalid cmd_buf_state was found. This is a fatal error.
-} lsejtag_fetch_cmd_result;
+    dpr_corrupt_state,  // An invalid cmd_buf_state was found. This is a fatal error.
+} lsejtag_dispatch_result;
 
 typedef enum {
-    cer_success,        // Command executed successfully and all peripheral accesses have finished.
-                        // This is returned for commands that can finish without manipulating JTAG
-                        // port, for example, firmware version request.
-    cer_jtag_started,   // Command executed successfully, JTAG port is doing data exchange
+    cer_success,        // Command executed successfully. This does not imply peripheral state (like
+                        // JTAG controller). When dispatch routine is called again, user might get a
+                        // useful instruction about what to do with other peripherals, like USB and
+                        // JTAG controller.
     cer_continue,       // Command was partially executed, because more data has to be sent to/
                         // received from the host. This is a special return code for
                         // fast_target_mem_read/write ops. When this code was returned, buffer state
                         // is not cleared to cbs_clean, and command continuation context info will
                         // be filled in preparation to next stage of execution.
-    cer_await_jtag_buf, //
-    cer_await_usb_tx,   // Command was not executed because USB TX FIFO is full.
+    cer_await_jtag_buf, // Command was not executed because JTAG I/O buffer is full. There are two
+                        // JTAG buffers, and a JTAG related command may execute when any of them is
+                        // free. But when both buffer blocks are full, this error is emitted.
+    cer_await_usb_tx,   // Command was not executed because USB TX FIFO is full. This is only
+                        // emitted when a command that requires immediate access to USB TX FIFO
+                        // (like probe memory RW, or firmware version read) is executed. When USB TX
+                        // FIFO is full but a JTAG buffer is free, JTAG related commands still may
+                        // execute, their USB TX FIFO check happens 
     cer_not_ready,      // Command was not executed because command buffer state is not ready.
     cer_bad_continue,   // Continuation context was valid for a command that does not support
                         // continuation. This is a fatal error.
@@ -125,6 +146,8 @@ typedef struct {
     uint16_t param_jtag_clk_div;
     uint8_t param_jtag_tdo_sample_timing;
 
+    // When this flag is set, hardware must be reconfigured
+    bool pending_reconfiguration;
 
     // Command continuation context. fast_target_mem_read/write ops may require receiving/sending
     // more data than it can receive/send in one go, therefore they have to be able to save the
@@ -136,31 +159,59 @@ typedef struct {
                         // For fast_reads: how many DWORDs of RAM need to be read from target (and
                         // encapsulated in the format that host understands and sent)
     
-    struct {
+    struct lsejtag_jtagbuf_blk {
         // JTAG IO busy indicators. This is used by `lsejtag_execute` to determine whether a command
         // can execute (if JTAG peripheral is still working and the current command has something to
         // do with JTAG port, then execution should be delayed). All flags are set when DMA was
-        // started. TDI and TMS are cleared by DMA finish ISRs. TDO is cleared by
-        // `lsejtag_flush_tdo()` after tdo_data buffer is written to USB TX FIFO.
+        // started. TDI and TMS are cleared by DMA finish ISRs.
         union {
             struct {
                 bool tdi_busy;
-                bool tdo_busy;
                 bool tms_busy;
+                // This prepared flag indicates that the buffer is filled with data and it's ready
+                // to be executed by `lsejtag_run_jtag`.
+                bool prepared;
             };
             uint32_t busy;
         };
-        // TDO buffer. tdo_data is the DMA-reader destination buffer. When DMA is finished,
-        // tdo_dwords should be filled by DMA ISR.
-        uint32_t tdo_dwords;    // How many DWORDs of collected TDO data needs to be sent through
-                                // USB. Only valid when larger than 0, and will be detected by
-                                // `lsejtag_fetch_cmd()` when it becomes larger than 0.
-        uint32_t tdo_data[64];
+        bool immediate_flush_tdo;
         // TDI/TMS buffer.
         uint32_t tdi_data[64];
         uint32_t tms_data[64];
+        // Misc data used when commanding JTAG peripherals.
         uint32_t tdi_bits;      // How many bits should be sent to TDI and TMS.
-    } jtagbuf_a, jtagbuf_b;
+        uint32_t tdo_bits;      // How many bits should be read from TDO, 0 for not reading back.
+        uint32_t tdo_skip_bits; // How many bits should be skipped before start reading TDO. This
+                                // value meant first n-th TCK cycles are skipped before reading TDO.
+    } jtagbuf_a, jtagbuf_b, *active_bufblk;
+
+    // TDO in buffer. tdo_data is the DMA-reader destination buffer. When DMA is finished,
+    // tdo_dwords should be increased by DMA ISR.
+    // Notice how TDO buffer is shared: this is because sometimes a command would demand the TDO
+    // read data not be sent back immediately, probably done to increase throughput. Therefore when
+    // a command doesn't demand TDO be sent back immediately, TDO data persists even when TDI/TMS
+    // buffer block changes. This has caused TDO buffer to stay outside of TDI/TMS buffer blocks.
+    // Of course, TDO busy bit is also checked when TDO flush was called/a new command was executed.
+    uint32_t tdo_in_dwords;     // How many DWORDs of collected TDO data exists in buffer. This is
+                                // increased by TDO readout DMA completion routine, and decreased/
+                                // cleared only when TDO buffer is flushed back to host.
+    uint32_t tdo_in_data[64];
+    uint32_t *tdo_dma_ptr;      // TDO buffer pointer, for DMA readout to write
+    uint32_t *tdo_flush_ptr;    // TDO buffer flush pointer, for TDO buffer flush routine.
+                                // Incremented when TDO is only partially flushed, and set back to
+                                // TDO buffer address when TDO is completely flushed.
+    bool tdo_busy;
+    // Set when running JTAG actions. Checked when on dispatch, to decide whether the buffer
+    // should be flushed when buffer has new data. Cleared only when TDO buffer is fully flushed.
+    bool tdo_immediate_flush;
+    // Set by TDO readout DMA completion routine, cleared by dispatch routine when it made a
+    // decision about whether the new data should be flushed.
+    bool tdo_have_new_data;
+    // Set by dispatch routine when it finds out the TDO buffer needs a flush, and this flag forces
+    // dispatch routine to tell user to flush TDO buffer indefinitely, until TDO buffer is cleared
+    // and the flush routine cleared this flag.
+    // Note: when command execution fails due to TDO buffer being too full
+    bool tdo_should_flush;
 } lsejtag_ctx;
 
 //==============================================================================
@@ -168,6 +219,25 @@ typedef struct {
 
 void lsejtag_init_ctx(lsejtag_ctx *ctx);
 
-lsejtag_fetch_cmd_result lsejtag_fetch_cmd(lsejtag_ctx *ctx);
+lsejtag_dispatch_result lsejtag_dispatch(lsejtag_ctx *ctx);
 
+lsejtag_cmd_exec_result lsejtag_execute(lsejtag_ctx *ctx);
 
+uint32_t lsejtag_flush_tdo(lsejtag_ctx *ctx);
+
+void lsejtag_run_jtag(lsejtag_ctx *ctx);
+
+static inline void lsejtag_jtag_complete_tdi(lsejtag_ctx *ctx) {
+    ctx->active_bufblk->tdi_busy = false;
+}
+
+static inline void lsejtag_jtag_complete_tms(lsejtag_ctx *ctx) {
+    ctx->active_bufblk->tms_busy = false;
+}
+
+static inline void lsejtag_jtag_complete_tdo(lsejtag_ctx *ctx, uint32_t dwords_recvd) {
+    ctx->tdo_busy = false;
+    ctx->tdo_have_new_data = true;
+    ctx->tdo_dma_ptr += dwords_recvd;
+    ctx->tdo_in_dwords += dwords_recvd;
+}
