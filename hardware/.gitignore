@@ -1,0 +1,6 @@
+*autosave*
+TmpProduction/
+*production/
+*-backups/
+*-info-cache
+*.kicad_prl
