@@ -86,8 +86,64 @@ void lsejtag_impl_io_manip(lsejtag_impl_io io, uint8_t level) {
     }
 }
 
-void lsejtag_impl_run_jtag_setup(uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits) {
+void lsejtag_impl_reconfigure(lsejtag_impl_recfg type, uint32_t param) {
+    switch (type) {
+    case impl_recfg_clkfreq: {
+        // System clock = 125MHz, CLKsys/4 = 31.25MHz (PIO internal timing) Loongson CLK = 15MHz
+        // By default we use 6 division for ~5MHz, highest stable frequency in my tests on LS2K0300
+        // Lookup table:
+        // 1 -> 1 (31.25 MHz)
+        // 2 -> 2 (15.625 MHz)
+        // 4 -> 4 (7.8125 MHz)
+        // 8 -> 8 (3.90625 MHz)
+        // 16 -> 15 (2.083 MHz)
+        // 32 -> 31 (1.008 MHz)
+        // 64 -> 63 (0.496 MHz)
+        // 128 -> 125 (0.250 MHz)
+        // 256 -> 250 (0.125 MHz)
+        // 512 -> 500 (62.5 kHz)
+        // ... (2^n multiplies 125)
+        uint32_t lut[] = { 1, 2, 4, 8, 15, 61, 63, 125,
+                           250, 500, 1000, 2000, 4000, 8000, 16000, 32000 };
+        uint32_t idx;
+
+        // Find out which bit is set
+        for (idx = 0; idx < 16; idx++) {
+            if ((1 << idx) & param) {
+                break;
+            }
+        }
+
+        // If no bit is found to be set, we just do nothing
+        if (idx >= 16) {
+            return;
+        }
+
+        // Set PIO SM 0/1/2 clock division
+        pio0->sm[0].clkdiv = lut[idx % 16] << 16;
+        pio0->sm[1].clkdiv = lut[idx % 16] << 16;
+        pio0->sm[2].clkdiv = lut[idx % 16] << 16;
+
+        printf("Selected division: 0x%08X, written division: 0x%08X\n",
+               lut[idx % 16],
+               pio0->sm[0].clkdiv);
+        break;
+    }
+
+    case impl_recfg_tdo_sample_time:
+        break;
+    }
+}
+
+// For debug purposes
+static int tdiCount = 0, tdoCount = 0, tmsCount = 0;
+
+void lsejtag_impl_run_jtag(const uint32_t *tdi_buf, const uint32_t *tms_buf, uint32_t *tdo_buf,
+                           uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits) {
+    // Stop all SMs so they can be started synchronously
     pio_set_sm_mask_enabled(pio0, 0x7, false);
+
+    // Write PIO control fields
     // Because of how PIO program is implemented, the counter values are always minus 1 when written
     // to PIO
     if (tdo_bits) {
@@ -97,16 +153,8 @@ void lsejtag_impl_run_jtag_setup(uint32_t tdi_bits, uint32_t tdo_bits, uint32_t 
     ejtag_ctx.tdo_recv_dword_count = BIT2DWORD(tdo_bits);
     *ejtag_ctx.tdi_write_addr = tdi_bits - 1;
     *ejtag_ctx.tms_write_addr = tdi_bits - 1;
-}
 
-// For debug purposes
-static int tdiCount = 0, tdoCount = 0, tmsCount = 0;
-
-void lsejtag_impl_run_jtag(const uint32_t *tdi_buf, const uint32_t *tms_buf, uint32_t *tdo_buf,
-                           uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits) {
-    //
-    lsejtag_impl_run_jtag_setup(tdi_bits, tdo_bits, tdo_skip_bits);
-
+    // Setup DMA
     dma_hw->ch[ejtag_ctx.tdi_chan].read_addr = (uint32_t)tdi_buf;
     dma_hw->ch[ejtag_ctx.tdi_chan].transfer_count = BIT2DWORD(tdi_bits);
     dma_hw->ch[ejtag_ctx.tms_chan].read_addr = (uint32_t)tms_buf;
@@ -121,6 +169,7 @@ void lsejtag_impl_run_jtag(const uint32_t *tdi_buf, const uint32_t *tms_buf, uin
         DbgPrint("TDO Seq: %08lX  %08lX\n", (tdo_skip_bits * 4 - 1), BIT2DWORD(tdo_bits) * 32 - 1);
     }
 
+    // Start DMA in sync, then start PIO in sync
     if (tdo_bits) {
         dma_hw->ch[ejtag_ctx.tdo_chan].write_addr = (uint32_t)tdo_buf;
         dma_hw->ch[ejtag_ctx.tdo_chan].transfer_count = BIT2DWORD(tdo_bits);
@@ -131,6 +180,7 @@ void lsejtag_impl_run_jtag(const uint32_t *tdi_buf, const uint32_t *tms_buf, uin
         pio_enable_sm_mask_in_sync(pio0, 0x3);
     }
 
+    // Ask LED to be illuminated
     ejtag_ctx.led_turn_on = 1;
 }
 

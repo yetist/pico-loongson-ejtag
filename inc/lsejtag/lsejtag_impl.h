@@ -47,6 +47,11 @@ typedef enum {
     impl_io_dint,
 } lsejtag_impl_io;
 
+typedef enum {
+    impl_recfg_clkfreq,
+    impl_recfg_tdo_sample_time,
+} lsejtag_impl_recfg;
+
 uint32_t lsejtag_impl_usbrx_len();
 
 uint32_t lsejtag_impl_usbtx_free_len();
@@ -57,7 +62,7 @@ void lsejtag_impl_usbtx(const uint8_t *data, uint32_t len);
 
 void lsejtag_impl_io_manip(lsejtag_impl_io io, uint8_t level);
 
-void lsejtag_impl_run_jtag_setup(uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits);
+void lsejtag_impl_reconfigure(lsejtag_impl_recfg type, uint32_t param);
 
 void lsejtag_impl_run_jtag(const uint32_t *tdi_buf, const uint32_t *tms_buf, uint32_t *tdo_buf,
                            uint32_t tdi_bits, uint32_t tdo_bits, uint32_t tdo_skip_bits);

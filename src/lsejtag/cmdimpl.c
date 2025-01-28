@@ -89,6 +89,10 @@ lsejtag_cmd_exec_result cmdimpl_probe_mem_rw(lsejtag_ctx *ctx) {
                     // In reality this should prevent JTAG port from doing any IO
                     ctx->param_jtag_clk_div = 0;
                 }
+
+                // Reconfigure JTAG when JTAG port is free
+                wait_until_jtag_periph_free(ctx);
+                lsejtag_impl_reconfigure(impl_recfg_clkfreq, ctx->param_jtag_clk_div);
                 break;
             }
             case 2:
