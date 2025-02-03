@@ -27,13 +27,14 @@ void lsejtag_init_ctx(lsejtag_ctx *ctx) {
     ctx->tdo_dma_ptr = ctx->tdo_in_data;
     ctx->tdo_flush_ptr = ctx->tdo_in_data;
 
-    // Default IR params
-    ctx->param_ir_len_bits = 4;
-    ctx->param_ir_skip = 0;
-    ctx->param_ir_control = 5;
-    ctx->param_ir_data = 4;
-    ctx->param_ir_address = 3;
-    ctx->param_ir_fastdata = 8;
+    // Default IR params are for MIPS. Debugger software will detect if this is a probe that support
+    // arbitrary IR parameters and modify these variables upon launch (see gdb-la.cmd).
+    ctx->param_ir_len_bits = 5;
+    ctx->param_ir_skip = 0xFF;
+    ctx->param_ir_control = 0xA;
+    ctx->param_ir_data = 0x9;
+    ctx->param_ir_address = 0x8;
+    ctx->param_ir_fastdata = 0xE;
 }
 
 lsejtag_dispatch_result lsejtag_dispatch(lsejtag_ctx *ctx) {
