@@ -4,7 +4,7 @@
 #define DISABLE_DBGPRINT
 
 #ifndef FIRMWARE_VERSION_STR
-#define FIRMWARE_VERSION_STR            "0.1.0"
+#define FIRMWARE_VERSION_STR            "0.2.0"
 #endif
 
 #ifndef DISABLE_DBGPRINT
