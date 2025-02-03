@@ -95,7 +95,7 @@ typedef struct {
 typedef struct __attribute((packed)) {
     lsejtag_cmd_header_fast_target_mem_write header;
     uint16_t jtag_clk_div;
-    uint32_t data_len_bytes;
+    uint32_t data_len_xfer_count;
     uint16_t at_cpu_core;
     uint32_t data[0];
 } lsejtag_cmd_fast_target_mem_write_at_core;
@@ -103,7 +103,7 @@ typedef struct __attribute((packed)) {
 typedef struct {
     lsejtag_cmd_header_fast_target_mem_write header;
     uint16_t jtag_clk_div;
-    uint32_t data_len_dword_count;
+    uint32_t data_len_xfer_count;
     uint32_t data[0];
 } lsejtag_cmd_fast_target_mem_write;
 
