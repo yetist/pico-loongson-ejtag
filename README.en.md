@@ -1,6 +1,8 @@
 
 # Pico Loongson EJTAG
 
+Click here for cost-reduced new design >> [CH32 Loongson EJTAG](https://github.com/RigoLigoRLC/ch32-loongson-ejtag)
+
 Welcome aboard! This is an exciting project for fellow Loongson embedded developer hobbyists. It is a reimplementation of Loongson's EJTAG probe box, and aims to be functionally equivalent and host-software compatible with the official implementation.
 
 My initial intent of building this project is help expanding the ecosystem of Loongson hardware. We know that Loongson made impressive improvements on dedsktop-class processors like 3A6000, but these systems are relatively bulky, expensive and still not *quite* comparable with modern day Western-world-produced hardwares and made a lot people refrain from buying them (myself included). But this has changed, thanks to the emergence of 2K0300 boards. This is an SoC that has comparable CoreMark to popular chips like iMX6ULL, can run both Linux and baremetal, sells dirt cheap (simple SBC available for 100 RMB) and is really small in size, effectively acting as a portal to enter LoongArch world with little cost. Unfortunately, I'm more of a "baremetal embedded developer" and Linux does not serve everyone's need either. While running baremetal applications is largely possible on 2K0300, the debug probe for flashing its firmware always costs a ton. Since Loongson mainly focused on their desktop chips previously, they aren't putting much attention to the embedded world (2K0300 only had an incomplete SDK, made by third-party developer, whose IDE shamely runs only on Windows machines) and I think it's time to prove that we embedded developers can pave our own way for the open LoongArch embedded ecosystem.
